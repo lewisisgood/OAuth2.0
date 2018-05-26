@@ -11,6 +11,8 @@ import string
 
 from oauth2client.client import flow_from_clientsecrets
 from oauth2client.client import FlowExchangeError
+from google.oauth2 import id_token as gauth_id_token
+from google.auth.transport import requests as gauth_requests
 import httplib2
 import json
 from flask import make_response
@@ -38,7 +40,7 @@ def showLogin():
                     for x in xrange(32))
     login_session['state'] = state
     # return "The current session state is %s" % login_session['state']
-    return render_template('login.html', STATE=state)
+    return render_template('login.html', STATE=state, CLIENT_ID=CLIENT_ID)
 
 
 @app.route('/gconnect', methods=['POST'])
@@ -49,21 +51,10 @@ def gconnect():
         response.headers['Content-Type'] = 'application/json'
         return response
     # Obtain authorization code
-    code = request.data
-
-    try:
-        # Upgrade the authorization code into a credentials object
-        oauth_flow = flow_from_clientsecrets('client_secrets.json', scope='')
-        oauth_flow.redirect_uri = 'postmessage'
-        credentials = oauth_flow.step2_exchange(code)
-    except FlowExchangeError:
-        response = make_response(
-            json.dumps('Failed to upgrade the authorization code.'), 401)
-        response.headers['Content-Type'] = 'application/json'
-        return response
+    tokens = request.json
 
     # Check that the access token is valid.
-    access_token = credentials.access_token
+    access_token = tokens.get('access_token')
     url = ('https://www.googleapis.com/oauth2/v1/tokeninfo?access_token=%s'
            % access_token)
     h = httplib2.Http()
@@ -74,14 +65,6 @@ def gconnect():
         response.headers['Content-Type'] = 'application/json'
         return response
 
-    # Verify that the access token is used for the intended user.
-    gplus_id = credentials.id_token['sub']
-    if result['user_id'] != gplus_id:
-        response = make_response(
-            json.dumps("Token's user ID doesn't match given user ID."), 401)
-        response.headers['Content-Type'] = 'application/json'
-        return response
-
     # Verify that the access token is valid for this app.
     if result['issued_to'] != CLIENT_ID:
         response = make_response(
@@ -89,7 +72,23 @@ def gconnect():
         print "Token's client ID does not match app's."
         response.headers['Content-Type'] = 'application/json'
         return response
-
+        
+    # Verify that the id token is valid and used for the intended user.
+    id_token = tokens.get('id_token')
+    try:
+        idinfo = gauth_id_token.verify_oauth2_token(id_token, gauth_requests.Request(), CLIENT_ID)
+        if idinfo['iss'] not in ['accounts.google.com', 'https://accounts.google.com']:
+            raise ValueError("Token's issuer is incorrect.")
+            
+    except ValueError as e:
+        response = make_response(
+                json.dumps(str(e)), 401)
+        print str(e)
+        response.headers['Content-Type'] = 'application/json'
+        return response
+    
+    # ID token is valid; is user logged in?
+    gplus_id = idinfo['sub']
     stored_access_token = login_session.get('access_token')
     stored_gplus_id = login_session.get('gplus_id')
     if stored_access_token is not None and gplus_id == stored_gplus_id:
@@ -98,20 +97,14 @@ def gconnect():
         response.headers['Content-Type'] = 'application/json'
         return response
 
-    # Store the access token in the session for later use.
-    login_session['access_token'] = credentials.access_token
+    # Store the access token and id token in the session for later use.
+    login_session['access_token'] = access_token
+    login_session['id_token'] = id_token
     login_session['gplus_id'] = gplus_id
 
-    # Get user info
-    userinfo_url = "https://www.googleapis.com/oauth2/v1/userinfo"
-    params = {'access_token': credentials.access_token, 'alt': 'json'}
-    answer = requests.get(userinfo_url, params=params)
-
-    data = answer.json()
-
-    login_session['username'] = data['name']
-    login_session['picture'] = data['picture']
-    login_session['email'] = data['email']
+    login_session['username'] = idinfo['name']
+    login_session['picture'] = idinfo['picture']
+    login_session['email'] = idinfo['email']
 
     # See if a user exists, if it doesn't make a new one
     user_id = getUserID(login_session['email'])
